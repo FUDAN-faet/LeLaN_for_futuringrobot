@@ -1,0 +1,7 @@
+train/wandb
+train/logs
+deployment/model_weights
+__pycache__/
+*.pyc
+dataset
+download_youtube/videos
