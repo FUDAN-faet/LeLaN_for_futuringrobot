@@ -2,7 +2,7 @@
 import os
 import sys
 import io
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 # ROS
 from sensor_msgs.msg import Image
