@@ -1,4 +1,8 @@
+"""部署脚本共用的工具函数。
 
+对 LeLaN 来说，这里最关键的是 load_model()：
+它会先根据 YAML 配置重建正确的网络结构，再加载 checkpoint。
+"""
 import os
 import sys
 import io
@@ -39,7 +43,9 @@ def load_model(
 ) -> nn.Module:
     """Load a model from a checkpoint file (works with models trained on multiple GPUs)"""
     model_type = config["model_type"]
-    
+
+    # 先按训练时的配置重建模型，再加载序列化权重。
+    # 这个函数会被 ViNT / NoMaD / LeLaN 的部署脚本共用。
     if model_type == "gnm":
         model = GNM(
             config["context_size"],
@@ -98,6 +104,7 @@ def load_model(
         )
     elif config["model_type"] == "lelan":
         if config["vision_encoder"] == "lelan_clip_film":
+            # 简化版 LeLaN：用 FiLM 视觉编码器把当前图像和 CLIP 文本特征融合。
             vision_encoder = LeLaN_clip_FiLM(
                 obs_encoding_size=config["encoding_size"],
                 context_size=config["context_size"],
@@ -125,6 +132,7 @@ def load_model(
           
     elif config["model_type"] == "lelan_col" or config["model_type"] == "lelan_col2":
         if config["vision_encoder"] == "lelan_clip_film":
+            # 带碰撞规避偏好的版本：除了当前帧和语言，还会额外使用短历史图像。
             vision_encoder = LeLaN_clip_FiLM_temp(
                 obs_encoding_size=config["encoding_size"],
                 context_size=config["context_size"],
@@ -170,6 +178,8 @@ def load_model(
             noise_pred_net=noise_pred_net_nomad,
             dist_pred_net=dist_pred_network_nomad,
         )
+        # 这里重建 model_nomad 只是因为原始训练流程里它充当教师模型。
+        # 在线部署真正返回的仍然只有 LeLaN 本体。
         """
         noise_scheduler = DDPMScheduler(
             num_train_timesteps=config["num_diffusion_iters"],
@@ -183,9 +193,11 @@ def load_model(
     
     checkpoint = torch.load(model_path, map_location=device)
     if model_type == "nomad" or model_type == "lelan" or model_type == "lelan_col" or model_type == "lelan_col2":
+        # 这几类 checkpoint 直接保存的是 state_dict。
         state_dict = checkpoint
         model.load_state_dict(state_dict, strict=True)
     else:
+        # 更老的 checkpoint 保存的是完整 nn.Module。
         loaded_model = checkpoint["model"]
         try:
             state_dict = loaded_model.module.state_dict()
@@ -197,6 +209,7 @@ def load_model(
     return model
 
 def pil2cv(image):
+	# PIL 默认是 RGB(A)，OpenCV 默认是 BGR(A)。
 	new_image = np.array(image, dtype=np.uint8)
 	if new_image.ndim == 2:
 		pass
@@ -207,6 +220,7 @@ def pil2cv(image):
 	return new_image
 
 def cv2pil(image):
+	# 把 OpenCV 图像转回 PIL，方便 torchvision/ROS 后续处理。
 	new_image = image.copy()
 	if new_image.ndim == 2:
 		pass
@@ -218,6 +232,7 @@ def cv2pil(image):
 	return new_image
 
 def msg_to_pil(msg: Image) -> PILImage.Image:
+    # 将 ROS Image 消息尽量直接转成 PIL 图像。
     img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
         msg.height, msg.width, -1)
     pil_image = PILImage.fromarray(img)
@@ -239,6 +254,7 @@ def to_numpy(tensor):
 
 def transform_images(pil_imgs: List[PILImage.Image], image_size: List[int], center_crop: bool = False) -> torch.Tensor:
     """Transforms a list of PIL image to a torch tensor."""
+    # 保持 ViNT/NoMaD 的约定：每张图各自归一化，再沿通道维拼接。
     transform_type = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -264,6 +280,9 @@ def transform_images(pil_imgs: List[PILImage.Image], image_size: List[int], cent
     
 def transform_images_lelan(pil_imgs: List[PILImage.Image], image_size: List[int], center_crop: bool = False) -> torch.Tensor:
     """Transforms a list of PIL image to a torch tensor."""
+    # LeLaN 在线会同时使用两种分辨率：
+    # - 96x96 的低分辨率历史帧堆叠，给时序分支
+    # - 配置里的高分辨率当前帧，给 FiLM 编码器
     transform_type = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -288,6 +307,7 @@ def transform_images_lelan(pil_imgs: List[PILImage.Image], image_size: List[int]
         transf_img = torch.unsqueeze(transf_img, 0)
         transf_imgs.append(transf_img)
 
+    # 最新一帧会保留为高分辨率，因为提示词条件视觉编码器需要它。
     pil_img = pil_imgs[-1].resize(image_size) 
     transf_imgx = transform_type(pil_img)       
     #cur_img = 2.0*(torch.unsqueeze(transf_imgx, 0) - 0.5)

@@ -10,6 +10,11 @@ import clip
 
 
 class LeLaN_clip_FiLM(nn.Module):
+    """单帧版 LeLaN 编码器。
+
+    它会先把 CLIP 文本特征变成 FiLM 参数，用这些参数调制视觉主干，
+    再把得到的视觉特征压缩并送入一个轻量 transformer 继续融合。
+    """
     def __init__(
         self,
         context_size: int = 5,
@@ -29,7 +34,7 @@ class LeLaN_clip_FiLM(nn.Module):
         self.goal_encoding_size = obs_encoding_size
         self.context_size = context_size
         
-        # Initialize the observation encoder
+        # 根据所选 CLIP 文本特征维度，构建对应大小的 FiLM 视觉主干。
         if clip_type == "ViT-B/32":
             self.film_model = build_film_model(8, 10, 128, 512)
         elif clip_type == "ViT-L/14@336px":
@@ -44,7 +49,8 @@ class LeLaN_clip_FiLM(nn.Module):
         else:
             self.compress_goal_enc = nn.Identity()
 
-        # Initialize positional encoding and self-attention layers
+        # 虽然单帧版本质上只有一个 token，但这里仍保留浅层 transformer，
+        # 这样它和时序版的接口保持一致。
         self.positional_encoding = PositionalEncoding(self.obs_encoding_size, max_seq_len=2) #no context
         self.sa_layer = nn.TransformerEncoderLayer(
             d_model=self.obs_encoding_size, 
@@ -65,10 +71,8 @@ class LeLaN_clip_FiLM(nn.Module):
 
     def forward(self, obs_img: torch.tensor, feat_text: torch.tensor):#inst_ref: torch.tensor
         device = obs_img.device
-        # Initialize the goal encoding
-        goal_encoding = torch.zeros((obs_img.size()[0], 1, self.goal_encoding_size)).to(device)
-
-        # Get the goal encoding
+        # 这里没有额外单独的 goal image token，
+        # 而是直接用文本特征去条件化当前图像本身。
         obsgoal_img = obs_img       
         inst_encoding = feat_text
         obsgoal_encoding = self.film_model(obsgoal_img, inst_encoding)
@@ -80,7 +84,7 @@ class LeLaN_clip_FiLM(nn.Module):
         assert obsgoal_encoding.shape[2] == self.goal_encoding_size
         obs_encoding = obsgoal_encoding                
         
-        # Apply positional encoding 
+        # 保持与时序编码器一致的输出形状。
         if self.positional_encoding:
             obs_encoding = self.positional_encoding(obs_encoding)
 
@@ -90,6 +94,7 @@ class LeLaN_clip_FiLM(nn.Module):
         return obs_encoding_tokens
 
 class LeLaN_clip_FiLM_temp(nn.Module):
+    """带短历史图像与 prompt 条件的时序版 LeLaN 编码器。"""
     def __init__(
         self,
         context_size: int = 5,
@@ -109,7 +114,7 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         self.goal_encoding_size = obs_encoding_size
         self.context_size = context_size
         
-        # Initialize the observation encoder
+        # 历史帧走 EfficientNet，当前帧则通过下面的 FiLM 分支与 prompt 融合。
         if obs_encoder.split("-")[0] == "efficientnet":
             self.obs_encoder = EfficientNet.from_name(obs_encoder, in_channels=3) # context
             self.obs_encoder = replace_bn_with_gn(self.obs_encoder)
@@ -124,7 +129,7 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         else:
             self.compress_obs_enc = nn.Identity()
         
-        # Initialize FiLM model for visual encoder
+        # 当前帧通过 FiLM 与 prompt 做条件融合。
         if clip_type == "ViT-B/32":
             self.film_model = build_film_model(8, 10, 128, 512)
         elif clip_type == "ViT-L/14@336px":
@@ -139,7 +144,7 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         else:
             self.compress_goal_enc = nn.Identity()
 
-        # Initialize positional encoding and self-attention layers
+        # 最终由 transformer 融合：历史 token + 一个带 prompt 条件的当前帧 token。
         self.positional_encoding = PositionalEncoding(self.obs_encoding_size, max_seq_len=self.context_size + 2) #no context
         self.sa_layer = nn.TransformerEncoderLayer(
             d_model=self.obs_encoding_size, 
@@ -163,10 +168,10 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         device = obs_img.device
         goal_encoding = torch.zeros((obs_img.size()[0], 1, self.goal_encoding_size)).to(device)
                 
-        # text feature
+        # CLIP 文本特征由模块外部先算好，再传进来。
         inst_encoding = feat_text
         
-        # Get the goal encoding
+        # 当前图像先被编码成一个带 prompt 条件的 token。
         obsgoal_encoding = self.film_model(current_img, inst_encoding)        
         obsgoal_encoding_cat = obsgoal_encoding.flatten(start_dim=1)
         obsgoal_encoding = self.compress_goal_enc(obsgoal_encoding_cat)    
@@ -176,7 +181,7 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         assert obsgoal_encoding.shape[2] == self.goal_encoding_size
         goal_encoding = obsgoal_encoding         
             
-        # Get the observation encoding
+        # dataloader 会先把历史帧沿通道维拼起来，这里再拆回一张张 RGB 图分别编码。
         obs_img_list = torch.split(obs_img, 3, dim=1)        
         obs_img = torch.concat(obs_img_list, dim=0)        
         obs_encoding = self.obs_encoder.extract_features(obs_img)
@@ -191,7 +196,7 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         obs_encoding = torch.transpose(obs_encoding, 0, 1)      
         obs_encoding = torch.cat((obs_encoding, goal_encoding), dim=1)
         
-        # Apply positional encoding 
+        # transformer 最终看到的是 [历史帧..., 当前 prompt 条件 token]。
         if self.positional_encoding:
             obs_encoding = self.positional_encoding(obs_encoding)
 
@@ -256,6 +261,7 @@ def replace_submodules(
 
 
 def create_conv_layer(in_channels, out_channels, kernel_size, stride, padding):
+    # 轻量 FiLM 视觉塔里复用的卷积层构造函数。
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding),
         nn.ReLU(inplace=True),
@@ -264,6 +270,7 @@ def create_conv_layer(in_channels, out_channels, kernel_size, stride, padding):
 
 
 class InitialFeatureExtractor(nn.Module):
+    """FiLM 调制前的前段空间特征提取器。"""
     def __init__(self):
         super(InitialFeatureExtractor, self).__init__()
         
@@ -277,6 +284,7 @@ class InitialFeatureExtractor(nn.Module):
         return self.layers(x)
 
 class IntermediateFeatureExtractor(nn.Module):
+    """FiLM 残差块之后继续提特征的后段卷积塔。"""
     def __init__(self):
         super(IntermediateFeatureExtractor, self).__init__()
         
@@ -292,6 +300,7 @@ class IntermediateFeatureExtractor(nn.Module):
 
         
 class FiLMTransform(nn.Module):
+    """用文本生成的 gamma/beta 做逐通道仿射调制。"""
     def __init__(self):
         super(FiLMTransform, self).__init__()
         
@@ -305,6 +314,7 @@ class FiLMTransform(nn.Module):
         
         
 class ResidualBlock(nn.Module):
+    """在归一化特征上施加 FiLM 调制的残差块。"""
     def __init__(self, in_channels, out_channels):
         super(ResidualBlock, self).__init__()
         
@@ -331,6 +341,7 @@ class ResidualBlock(nn.Module):
         return x
 
 class FinalClassifier(nn.Module):
+    """保留下来的原始 FiLM 分类头，这里基本不参与主流程。"""
     def __init__(self, input_channels, num_classes):
         super(FinalClassifier, self).__init__()
         
@@ -356,6 +367,7 @@ class FinalClassifier(nn.Module):
         
         
 class FiLMNetwork(nn.Module):
+    """根据语言特征生成条件化的视觉特征。"""
     def __init__(self, num_res_blocks, num_classes, num_channels, question_dim):
         super(FiLMNetwork, self).__init__()
         question_feature_dim = question_dim
@@ -378,10 +390,12 @@ class FiLMNetwork(nn.Module):
         device = x.device
         
         x = self.initial_feature_extractor(x)
+        # 把文本特征变成每个残差块各自的一组 (beta, gamma)。
         film_params = self.film_param_generator(question).view(
             batch_size, self.num_res_blocks, 2, self.num_channels)
         
         d = x.size(2)
+        # 额外拼接坐标通道，让网络保留基本的空间位置信息。
         coords = torch.arange(-1, 1 + 0.00001, 2 / (d-1)).to(device)
         coord_x = coords.expand(batch_size, 1, d, d)
         coord_y = coords.view(d, 1).expand(batch_size, 1, d, d)
@@ -398,6 +412,7 @@ class FiLMNetwork(nn.Module):
         return features
 
 def build_film_model(num_res_blocks, num_classes, num_channels, question_dim):
+    # 小型工厂函数，保持原训练代码的调用风格。
     return FiLMNetwork(num_res_blocks, num_classes, num_channels, question_dim)
 
 

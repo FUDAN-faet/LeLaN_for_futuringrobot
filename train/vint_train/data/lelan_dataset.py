@@ -24,6 +24,12 @@ from vint_train.data.data_utils import (
 ) 
 
 class LeLaN_Dataset(Dataset):
+    """LeLaN 训练用数据集。
+
+    每一帧图像都会对应一个 pickle 文件，里面可能包含多个候选目标标注。
+    在 __getitem__ 里，数据集会随机挑一个有效目标，取出它的 prompt、
+    相对位姿和目标裁剪图，然后返回观测图像与监督信号。
+    """
     def __init__(
         self,
         data_split_folder: str,
@@ -84,7 +90,7 @@ class LeLaN_Dataset(Dataset):
         self.dataset_name = dataset_name
         self.only_front = only_front
 
-        # load data/data_config.yaml
+        # 读取数据集自己的度量尺度，比如 waypoint 的米制间隔。
         with open(
             os.path.join(os.path.dirname(__file__), "data_config.yaml"), "r"
         ) as f:
@@ -125,9 +131,7 @@ class LeLaN_Dataset(Dataset):
 
         self._get_augdata()
         
-        """
-        If the cache file doesn't exist, create it by iterating through the dataset and writing each image to the cache
-        """
+        # 先把图片写进本地 LMDB，避免后续每个 epoch 都重复从磁盘逐张读取。
         if not os.path.exists(cache_filename):
             with lmdb.open(cache_filename, map_size=2**40) as image_cache:
                 with image_cache.begin(write=True) as txn:
@@ -152,6 +156,7 @@ class LeLaN_Dataset(Dataset):
         return [item for item in A if item not in B]
             
     def _load_split_index(self):
+        # 发布版本里的不同数据集目录结构不完全一样，所以这里按数据集名字分别处理。
         if self.dataset_name == "go_stanford4":
             self.v_random = 0.2 #for random cropping
             self.h_random = 0.1 #for random cropping
@@ -294,6 +299,7 @@ class LeLaN_Dataset(Dataset):
         #return TF.resize(2.0*(image - 0.5), size)
         
     def _get_augdata(self, ):
+        # pickle 文件里存的是目标检测框、prompt、相对位姿等标注信息。
         aug_data_list = []
         for num in range(len(self.pickle_path)):
             if os.path.getsize(self.pickle_path[num]) > 0:            
@@ -330,11 +336,13 @@ class LeLaN_Dataset(Dataset):
         if self.backside and ib > 0.5:
             flag_back = 1
         
-        #remove data without object in front of the robot
+        # 一直重采样，直到找到“可用目标”：
+        # 目标可见、prompt 合法、距离不过远。
         while flag_data == 0:
             image_fullsize = self._load_image_front(self.image_path[iv])
             flag_data_inner = 0
             
+            # 构造以当前帧结尾的时序上下文窗口。
             context_image = [image_fullsize]        
             for ih in range(self.context_size):
                 if iv-ih > 0:                   
@@ -349,11 +357,13 @@ class LeLaN_Dataset(Dataset):
       
             pickle_values = self.aug_data_list[iv]                
             if len(pickle_values) != 0:
+                # 同一帧里可能有多个候选目标标注。
                 list_rand = [random.randint(0, len(pickle_values)-1) for i in range(len(pickle_values))]            
                 il = 0
                 c_pose_check = 0
                 while flag_data_inner == 0:
                     ir = list_rand[il]
+                    # 如果启用了前/后半球视图，只保留落在当前可见半边里的目标。
                     if flag_back == 0: #flag_back = 0 --> front-side, flag_back = 1 --> back-side
                         thres_data = pickle_values[ir]["bbox"][3] <= 224 and pickle_values[ir]["obj_detect"]
                     else:
@@ -385,6 +395,7 @@ class LeLaN_Dataset(Dataset):
                         else:
                             bbox_right = 223
                                                                                 
+                        # 裁出目标区域，主要用于可视化和带碰撞监督的教师分支。
                         image_crop = image_fullsize[:, bbox_top:bbox_bottom, bbox_left:bbox_right]                        
                         if flag_back == 0:
                             pose_obj = pickle_values[ir]["pose_median"]
@@ -393,6 +404,7 @@ class LeLaN_Dataset(Dataset):
                         
                         flag_text = 0
                         if "prompt" in pickle_values[ir].keys():
+                            # 一个目标可能有多个语言改写，训练时随机选一条增强鲁棒性。
                             ii = random.randint(0, len(pickle_values[ir]["prompt"])-1)
                             inst_obj = pickle_values[ir]["prompt"][ii]
 
@@ -402,6 +414,7 @@ class LeLaN_Dataset(Dataset):
                                 flag_text = 1                                                                                                           
                         inst_obj_x = inst_obj
 
+                        # 发布版训练会忽略太远的目标，以及 prompt 标注不合法的样本。
                         if pickle_values[ir]["pose_median"][0]**2 + pickle_values[ir]["pose_median"][2]**2 > 10.0**2 or flag_text == 0: 
                             c_pose_check += 1
                             if c_pose_check == 5:                  
@@ -420,6 +433,7 @@ class LeLaN_Dataset(Dataset):
             else:
                 iv = random.randint(0, len(self.image_path)-1)
             
+        # 对选中帧做小范围随机裁切，作为数据增强。
         voffset = int(224.0*self.v_random*random.random())
         hoffset = int(224.0*self.h_random*random.random())
 
@@ -434,9 +448,11 @@ class LeLaN_Dataset(Dataset):
             else:
                 for ih in range(self.context_size + 1):  
                     image_obs_list.append(self._resize_norm(context_image[ih][:, voffset:224-voffset, 224+hoffset:2*224-hoffset], self.image_size))                   
+        # 返回时的时序堆叠顺序是：从更早的帧到更新的帧。
         image_obs = torch.cat(image_obs_list[::-1])      
         image_crop = self._resize_norm(image_crop, self.image_size)        
        
+        # 做水平翻转时，也要同步翻转目标相对位置。
         if random.random() > 0.5:
             image_obs_r = torch.flip(image_obs, [2])
             image_crop_r = torch.flip(image_crop, [2])
@@ -445,6 +461,7 @@ class LeLaN_Dataset(Dataset):
             image_obs_r = image_obs
             image_crop_r = image_crop
             ob_pose_r = np.array((pose_obj[0], pose_obj[2]))        
+        # NoMaD 监督会用归一化后的目标位置，而基础 LeLaN 损失用的是原始相对位置。
         ob_pose_norm = ob_pose_r/self.data_config["metric_waypoint_spacing"] * self.waypoint_spacing
         
         return (

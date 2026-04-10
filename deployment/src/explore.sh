@@ -14,24 +14,21 @@ tmux selectp -t 2    # select the new, second (2) pane
 tmux splitw -v -p 50 # split it into two halves
 tmux selectp -t 0    # go back to the first pane
 
-# Run the roslaunch command in the first pane
+# Run the ROS 2 launch file in the first pane
 tmux select-pane -t 0
-tmux send-keys "roslaunch vint_locobot.launch" Enter
+tmux send-keys "ros2 launch lelan_deployment vint_locobot.launch.py" Enter
 
-# Run the navigate.py script with command line args in the second pane
+# Run the explore node with command line args in the second pane
 tmux select-pane -t 1
-# tmux send-keys "conda activate vint_deployment" Enter
-tmux send-keys "python explore.py $@" Enter
+tmux send-keys "ros2 run lelan_deployment explore $@" Enter
 
-# Run the teleop.py script in the third pane
+# Run the teleop node in the third pane
 tmux select-pane -t 2
-# tmux send-keys "conda activate vint_deployment" Enter
-tmux send-keys "python joy_teleop.py" Enter
+tmux send-keys "ros2 run lelan_deployment joy_teleop" Enter
 
-# Run the pd_controller.py script in the fourth pane
+# Run the PD controller in the fourth pane
 tmux select-pane -t 3
-tmux send-keys "conda activate vint_deployment" Enter
-tmux send-keys "python pd_controller.py" Enter
+tmux send-keys "ros2 run lelan_deployment pd_controller" Enter
 
 # Attach to the tmux session
 tmux -2 attach-session -t $session_name

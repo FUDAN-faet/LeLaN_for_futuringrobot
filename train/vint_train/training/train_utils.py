@@ -545,7 +545,8 @@ def twist_to_pose_diff_torch(v, w, dt):
     return x, z, theta
 
 def robot_pos_model_fix(linear_vel, angular_vel):
-    # velocity commands integral
+    # 把预测出的速度序列积分成机器人坐标系里的轨迹。
+    # LeLaN 监督的重点不是“速度像不像标签”，而是“按这串速度走完后会不会到目标附近”。
     bs, chorizon = linear_vel.shape
     device = linear_vel.device
 
@@ -638,16 +639,20 @@ def train_lelan(
             batch_obs_images = transform(obs_image).to(device)
             batch_obj_poses = obj_poses.to(device)
             
+            # 把随机采样到的目标描述（如 "office chair"）转成 CLIP token。
             batch_obj_inst = clip.tokenize(obj_inst, truncate=True).to(device)          
             
             with torch.no_grad():  
+                # CLIP 文本分支在这里充当冻结的 prompt 编码器。
                 feat_text = model("text_encoder", inst_ref=batch_obj_inst)
             
             B = batch_obs_images.shape[0]
             
+            # 根据当前图像和 prompt 预测一段未来控制序列。
             obsgoal_cond = model("vision_encoder", obs_img=batch_obs_images, feat_text = feat_text.to(dtype=torch.float32))
             linear_vel, angular_vel = model("dist_pred_net", obsgoal_cond=obsgoal_cond)
 
+            # 把这段速度积分成“如果机器人开环执行，会到达哪里”的最终相对位置。
             px_ref_list, pz_ref_list, ry_ref_list = robot_pos_model_fix(linear_vel, angular_vel)
             px_ref = px_ref_list[-1]
             pz_ref = pz_ref_list[-1]
@@ -655,7 +660,9 @@ def train_lelan(
  
             last_poses = torch.cat((px_ref.unsqueeze(1), pz_ref.unsqueeze(1)), axis=1)
                                 
+            # LeLaN 的主目标：积分后的终点尽量落在目标物体位置上。
             dist_loss = nn.functional.mse_loss(last_poses, batch_obj_poses)   
+            # 平滑项约束速度变化不要太突兀，减少抖动控制。
             diff_loss = nn.functional.mse_loss(linear_vel[:,:-1], linear_vel[:,1:]) + nn.functional.mse_loss(angular_vel[:,:-1], angular_vel[:,1:]) 
             
             # Total loss
@@ -789,11 +796,13 @@ def train_lelan_col(
             #batch_viz_obs_images = TF.resize((127.5*obs_image + 127.5).type(torch.uint8), VISUALIZATION_IMAGE_SIZE[::-1])
             #batch_viz_goal_images = TF.resize((127.5*goal_image + 127.5).type(torch.uint8), VISUALIZATION_IMAGE_SIZE[::-1])
                                                       
+            # 当前帧保留全分辨率，给 FiLM 条件分支使用。
             batch_obs_current = transform(obs_image).to(device)
 
             batch_goal_pos = goal_pos.to(device)
             batch_goal_pos_norm = goal_pos_norm.to(device)      
                         
+            # 历史帧降到更小分辨率编码，节省时序分支算力。
             batch_obs_images = [transform(TF.resize(obs, (96, 96), antialias=True)) for obs in obs_images_list]
             batch_obs_images = torch.cat(batch_obs_images, dim=1).to(device)
             batch_goal_images = transform(TF.resize(goal_image, (96, 96), antialias=True)).to(device)
@@ -808,6 +817,7 @@ def train_lelan_col(
             batch_goal_images_list = torch.split(batch_goal_images, B, dim=0)
 
             with torch.no_grad():
+                # 让冻结的 NoMaD 教师模型给出“最适合到达该目标位置”的避障轨迹监督。
                 select_traj = supervision_from_nomad(
                     ema_model_nomad,
                     noise_scheduler,
@@ -837,7 +847,7 @@ def train_lelan_col(
             ry_ref = ry_ref_list[-1]
             last_poses = torch.cat((px_ref.unsqueeze(1), pz_ref.unsqueeze(1)), axis=1)
 
-            #transformation from camera coordinate to robot coordinate
+            # 把 LeLaN 积分出来的轨迹转换到 NoMaD 使用的坐标系，便于直接比较。
             px_ref_listx = []
             pz_ref_listx = []
             for it in range(8):
@@ -845,9 +855,11 @@ def train_lelan_col(
                 pz_ref_listx.append(pz_ref_list[it].unsqueeze(1).unsqueeze(2))
             traj_policy = torch.concat((torch.concat(pz_ref_listx, axis=1), -torch.concat(px_ref_listx, axis=1)), axis=2)
                                 
+            # 位置损失和平滑损失与基础 LeLaN 保持一致。
             dist_loss = nn.functional.mse_loss(last_poses, batch_goal_pos)   
             diff_loss = nn.functional.mse_loss(linear_vel[:,:-1], linear_vel[:,1:]) + nn.functional.mse_loss(angular_vel[:,:-1], angular_vel[:,1:]) 
             
+            # 碰撞监督主要对较远目标更强调。
             mask_nomad = (batch_goal_pos[:,1:2] > 1.0).float().unsqueeze(1).repeat(1,8,2)
             mask_dist = (~(batch_goal_pos[:,1:2] > 1.0)).float()
             sum_dist = mask_dist.sum()            
@@ -1193,6 +1205,7 @@ def evaluate_lelan(
             
             B = batch_obs_images.shape[0]
             with torch.no_grad():
+                # 评估流程与训练一致：prompt 编码 -> 预测控制序列 -> 积分成最终位置。
                 batch_obj_inst = clip.tokenize(obj_inst, truncate=True).to(device)          
                 feat_text = ema_model("text_encoder", inst_ref=batch_obj_inst)                  
                 obsgoal_cond = ema_model("vision_encoder", obs_img=batch_obs_images, feat_text = feat_text.to(dtype=torch.float32))
@@ -1343,6 +1356,7 @@ def evaluate_lelan_col(
             batch_obs_current = transform(obs_image).to(device)
             batch_goal_pos = goal_pos.to(device)
             goal_pos_norm = goal_pos_norm.to(device)                              
+            # 保持与训练阶段相同的“双分辨率”输入约定。
             batch_obs_images = [transform(TF.resize(obs, (96, 96), antialias=True)) for obs in obs_images_list]
             batch_obs_images = torch.cat(batch_obs_images, dim=1).to(device)
             batch_goal_images = transform(TF.resize(goal_image, (96, 96), antialias=True)).to(device)
@@ -1354,6 +1368,7 @@ def evaluate_lelan_col(
             batch_goal_images_list = torch.split(batch_goal_images, B, dim=0)
 
             with torch.no_grad():
+                # 评估时也重新计算教师轨迹，这样才能报告与训练一致的碰撞对齐损失。
                 select_traj = supervision_from_nomad(
                     ema_model_nomad,
                     noise_scheduler,
@@ -1789,6 +1804,8 @@ def supervision_from_nomad(
     use_wandb: bool = True,
 ):
     """Plot samples from the exploration model."""
+    # 从冻结的 NoMaD 模型里采多条候选轨迹，
+    # 再选出终点最接近标注目标位置的那一条作为教师监督。
 
     max_batch_size = batch_obs_images.shape[0]
 
@@ -1827,6 +1844,7 @@ def supervision_from_nomad(
         gc_actions_torch = gc_actions_torch_list[i]
         gc_actions_torch_cat = torch.concat(torch.split(gc_actions_torch, 1, dim=1), axis=0).squeeze(1)  
         
+        # 在选教师轨迹前，先把 LeLaN 的目标坐标约定转换成 NoMaD 的动作坐标约定。
         batch_goal_pos_i = torch.tensor([batch_goal_pos[i][1], -batch_goal_pos[i][0]])    
         device = gc_actions_torch_cat.get_device()
         
