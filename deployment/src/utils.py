@@ -2,10 +2,14 @@
 import os
 import sys
 import io
+from pathlib import Path
 # import matplotlib.pyplot as plt
 
 # ROS
-from sensor_msgs.msg import Image
+try:
+    from sensor_msgs.msg import Image
+except ImportError:  # pragma: no cover - used only in ROS-facing helpers
+    Image = object
 
 # pytorch
 import torch
@@ -17,20 +21,23 @@ import numpy as np
 from PIL import Image as PILImage
 from typing import List, Tuple, Dict, Optional
 
-# models
-from vint_train.models.gnm.gnm import GNM
-from vint_train.models.vint.vint import ViNT
-
-from vint_train.models.vint.vit import ViT
-from vint_train.models.nomad.nomad import NoMaD, DenseNetwork
-from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
-from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from vint_train.data.data_utils import IMAGE_ASPECT_RATIO
 
-from vint_train.models.lelan.lelan import LeLaN_clip, LeLaN_clip_temp, DenseNetwork_lelan
-from vint_train.models.lelan.lelan_comp import LeLaN_clip_FiLM, LeLaN_clip_FiLM_temp
 import clip
 import cv2
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CLIP_CACHE_DIR = REPO_ROOT / ".cache" / "clip"
+
+
+def _load_clip_model(model_name: str, device: torch.device):
+    CLIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return clip.load(
+        model_name,
+        device=str(device),
+        download_root=str(CLIP_CACHE_DIR),
+    )
 
 def load_model(
     model_path: str,
@@ -41,6 +48,8 @@ def load_model(
     model_type = config["model_type"]
     
     if model_type == "gnm":
+        from vint_train.models.gnm.gnm import GNM
+
         model = GNM(
             config["context_size"],
             config["len_traj_pred"],
@@ -49,6 +58,8 @@ def load_model(
             config["goal_encoding_size"],
         )
     elif model_type == "vint":
+        from vint_train.models.vint.vint import ViNT
+
         model = ViNT(
             context_size=config["context_size"],
             len_traj_pred=config["len_traj_pred"],
@@ -61,6 +72,11 @@ def load_model(
             mha_ff_dim_factor=config["mha_ff_dim_factor"],
         )
     elif config["model_type"] == "nomad":
+        from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
+        from vint_train.models.nomad.nomad import NoMaD, DenseNetwork
+        from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
+        from vint_train.models.vint.vit import ViT
+
         if config["vision_encoder"] == "nomad_vint":
             vision_encoder = NoMaD_ViNT(
                 obs_encoding_size=config["encoding_size"],
@@ -97,6 +113,9 @@ def load_model(
             dist_pred_net=dist_pred_network,
         )
     elif config["model_type"] == "lelan":
+        from vint_train.models.lelan.lelan import LeLaN_clip, DenseNetwork_lelan
+        from vint_train.models.lelan.lelan_comp import LeLaN_clip_FiLM, replace_bn_with_gn
+
         if config["vision_encoder"] == "lelan_clip_film":
             vision_encoder = LeLaN_clip_FiLM(
                 obs_encoding_size=config["encoding_size"],
@@ -108,8 +127,8 @@ def load_model(
                 clip_type=config["clip_type"],
             )
             vision_encoder = replace_bn_with_gn(vision_encoder)   
-            
-            text_encoder, preprocess = clip.load(config["clip_type"]) #, device=device       
+
+            text_encoder, preprocess = _load_clip_model(config["clip_type"], device) #, device=device       
 
         else: 
             raise ValueError(f"Vision encoder {config['vision_encoder']} not supported")
@@ -124,6 +143,9 @@ def load_model(
             )                
           
     elif config["model_type"] == "lelan_col" or config["model_type"] == "lelan_col2":
+        from vint_train.models.lelan.lelan import LeLaN_clip_temp, DenseNetwork_lelan
+        from vint_train.models.lelan.lelan_comp import LeLaN_clip_FiLM_temp, replace_bn_with_gn
+
         if config["vision_encoder"] == "lelan_clip_film":
             vision_encoder = LeLaN_clip_FiLM_temp(
                 obs_encoding_size=config["encoding_size"],
@@ -135,25 +157,8 @@ def load_model(
                 clip_type=config["clip_type"],
             )
             vision_encoder = replace_bn_with_gn(vision_encoder)    
-            text_encoder, preprocess = clip.load(config["clip_type"])    
-            text_encoder.to(torch.float32)  
-            
-            vision_encoder_nomad = NoMaD_ViNT(
-                obs_encoding_size=config["encoding_size"],
-                context_size=config["context_size"],
-                mha_num_attention_heads=config["mha_num_attention_heads"],
-                mha_num_attention_layers=config["mha_num_attention_layers"],
-                mha_ff_dim_factor=config["mha_ff_dim_factor"],
-            )
-            vision_encoder_nomad = replace_bn_with_gn(vision_encoder_nomad)
-
-            noise_pred_net_nomad = ConditionalUnet1D(
-                    input_dim=2,
-                    global_cond_dim=config["encoding_size"],
-                    down_dims=config["down_dims"],
-                    cond_predict_scale=config["cond_predict_scale"],
-                )
-            dist_pred_network_nomad = DenseNetwork(embedding_dim=config["encoding_size"])
+            text_encoder, preprocess = _load_clip_model(config["clip_type"], device)    
+            text_encoder = text_encoder.to(device=device, dtype=torch.float32)
             dist_pred_network = DenseNetwork_lelan(embedding_dim=config["encoding_size"], control_horizon=config["len_traj_pred"])
             
         else: 
@@ -164,20 +169,6 @@ def load_model(
             dist_pred_net=dist_pred_network,            
             text_encoder=text_encoder,
         )
-        
-        model_nomad = NoMaD(
-            vision_encoder=vision_encoder_nomad,
-            noise_pred_net=noise_pred_net_nomad,
-            dist_pred_net=dist_pred_network_nomad,
-        )
-        """
-        noise_scheduler = DDPMScheduler(
-            num_train_timesteps=config["num_diffusion_iters"],
-            beta_schedule='squaredcos_cap_v2',
-            clip_sample=True,
-            prediction_type='epsilon'
-        )
-        """        
     else:
         raise ValueError(f"Invalid model type: {model_type}")
     
