@@ -6,5 +6,11 @@ __pycache__/
 dataset
 download_youtube/videos
 
+# local cache
 .cache/
+
+# build metadata
+*.egg-info/
+
+# local third-party checkout
 third_party_CLIP/

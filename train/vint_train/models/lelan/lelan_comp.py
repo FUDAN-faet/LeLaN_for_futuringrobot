@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from typing import List, Dict, Optional, Tuple, Callable
-from efficientnet_pytorch import EfficientNet
 from vint_train.models.vint.self_attention import PositionalEncoding
 
 import clip
@@ -111,6 +110,13 @@ class LeLaN_clip_FiLM_temp(nn.Module):
         
         # Initialize the observation encoder
         if obs_encoder.split("-")[0] == "efficientnet":
+            try:
+                from efficientnet_pytorch import EfficientNet
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "efficientnet_pytorch is required for lelan_col / lelan_col2 models"
+                ) from exc
+
             self.obs_encoder = EfficientNet.from_name(obs_encoder, in_channels=3) # context
             self.obs_encoder = replace_bn_with_gn(self.obs_encoder)
             self.num_obs_features = self.obs_encoder._fc.in_features
