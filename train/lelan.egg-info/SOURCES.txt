@@ -1,5 +1,6 @@
 README.md
 setup.py
+lelan/__init__.py
 lelan.egg-info/PKG-INFO
 lelan.egg-info/SOURCES.txt
 lelan.egg-info/dependency_links.txt

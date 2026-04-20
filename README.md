@@ -334,3 +334,185 @@ ros2 topic echo /cmd_vel_test
 - 也完全可以，只要它能提供一个 ROS RGB 图像话题和一个 `Twist` 控制话题
 - LeLaN 这一侧并不强依赖 TurtleBot 4
 - 这里只是因为 TurtleBot 4 是 ROS 2 Jazzy 下比较省事、官方支持也比较完整的 Gazebo 路线
+
+
+---------------------------------------------------------
+
+2026年4月20日改：实现了lelan的运行，但尚未达到好的精度。
+
+## 8. 五个终端联调清单（LeLaN + TurtleBot4 Gazebo）
+
+当前仓库推荐的运行方式是：
+
+* **终端 1**：conda `lelan` 环境中启动 **LeLaN 推理服务**
+* **终端 2**：ROS 2 Jazzy 中启动 **TurtleBot 4 Gazebo 仿真**
+* **终端 3**：ROS 2 Jazzy 中启动 **LeLaN bridge 节点**
+* **终端 4**：ROS 2 Jazzy 中启动 **机器人相机画面可视化**
+* **终端 5**：ROS 2 Jazzy 中启动 **速度话题监测**
+
+### 终端 1：启动 LeLaN 推理服务（GPU）
+
+先进入 conda 环境，再启动推理服务。
+下面示例使用带碰撞损失的版本：
+
+```bash
+source /home/zme/anaconda3/etc/profile.d/conda.sh
+conda activate lelan
+cd ~/navi_ws/src/lelan_for_futuringrobot
+
+python deployment/src/lelan_inference_server.py \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --prompt box \
+  --config train/config/lelan_col.yaml \
+  --model deployment/model_weights/with_col_loss.pth \
+  --device cuda
+```
+
+如果只想先跑最轻量版本，可以改成：
+
+```bash
+python deployment/src/lelan_inference_server.py \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --prompt box \
+  --config train/config/lelan.yaml \
+  --model deployment/model_weights/wo_col_loss_wo_temp.pth \
+  --device cuda
+```
+
+推理服务启动成功后，会打印：
+
+* `LeLaN inference server listening on 127.0.0.1:8765`
+* `device=cuda`
+* 当前 `model_path`
+* 当前 `config_path`
+* 当前 `prompt` 
+
+---
+
+### 终端 2：启动 TurtleBot 4 Gazebo 仿真
+
+```bash
+source /opt/ros/jazzy/setup.bash
+unset ROS_LOCALHOST_ONLY
+unset ROS_DOMAIN_ID
+
+ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py \
+  model:=standard \
+  world:=warehouse \
+  rviz:=false \
+  nav2:=false \
+  slam:=false
+```
+
+说明：
+
+* `rviz:=false`：联调时建议先关掉 RViz，避免无关日志干扰
+* `nav2:=false`、`slam:=false`：避免其他导航节点和 LeLaN 抢控制权
+* 当前仓库联调时，仿真中实际可用的 RGB 图像话题为：
+
+```bash
+/oakd/rgb/preview/image_raw
+```
+
+* 当前仿真中实际可用、且与 `Twist` 类型匹配的控制话题为：
+
+```bash
+/cmd_vel_unstamped
+```
+
+这两个话题已经在 TurtleBot 4 Gazebo 运行结果中确认可用。
+
+---
+
+### 终端 3：启动 LeLaN bridge 节点
+
+第一轮联调建议先把 LeLaN 输出发到测试话题 `/cmd_vel_test`，不要直接控车。
+
+```bash
+source /opt/ros/jazzy/setup.bashsh
+cd ~/navi_ws/src/lelan_for_futuringrobot
+
+python3 lelan_ros2/lelan_ros2/lelan_policy_node.py --ros-args \
+  -p inference_backend:=socket \
+  -p server_host:=127.0.0.1 \
+  -p server_port:=8765 \
+  -p image_topic:=/oakd/rgb/preview/image_raw \
+  -p cmd_vel_topic:=/cmd_vel_unstamped \
+  -p prompt:=chair \
+  -p use_ricoh:=false \
+  -p timer_period:=0.3 \
+  -p request_timeout:=10.0 \
+  -p max_linear_vel:=0.15 \
+  -p max_angular_vel:=0.30
+```
+
+说明：
+
+* `inference_backend:=socket`：通过 socket 调用终端 1 的推理服务 
+* `image_topic:=/oakd/rgb/preview/image_raw`：使用 TurtleBot 4 仿真相机
+* `cmd_vel_topic:=/cmd_vel_test`：先只验证输出，不直接驱动机器人
+* `prompt:=box`：在 `warehouse` 场景中，`box` 往往比 `chair` 更容易验证
+* `timer_period:=0.3`：联调时更稳
+* `max_linear_vel:=0.15`、`max_angular_vel:=0.30`：减小仿真中误动作风险
+
+如果已经验证 `/cmd_vel_test` 正常，并且希望让机器人真正动起来，只需要把：
+
+```bash
+-p cmd_vel_topic:=/cmd_vel_test
+```
+
+改成：
+
+```bash
+-p cmd_vel_topic:=/cmd_vel_unstamped
+```
+
+bridge 节点内部会：
+
+1. 订阅图像
+2. 发送 JPEG 编码图像和 prompt 到推理服务
+3. 收到 `linear_vel / angular_vel`
+4. 经过限幅后发布 `Twist` 
+
+---
+
+### 终端 4：启动机器人相机画面可视化
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 run image_tools showimage --ros-args -r image:=/oakd/rgb/preview/image_raw
+```
+
+用途：
+
+* 直接查看 LeLaN 实际收到的画面
+* 验证目标物是否真的在机器人前视图中清晰可见
+* 用于判断 `prompt` 与当前画面是否匹配
+
+---
+
+### 终端 5：启动速度监测节点
+
+第一轮建议监测测试话题：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic echo /cmd_vel_test
+```
+
+如果 bridge 已切到真实控制话题，则改成：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic echo /cmd_vel_unstamped
+```
+
+正常情况下，应该能看到非零的 `linear.x` 和/或 `angular.z`。
+如果输出持续全为 0，通常说明：
+
+* 当前画面里没有清晰目标
+* `prompt` 与当前场景不匹配
+* 推理服务未正确连接
+* bridge 未收到图像
