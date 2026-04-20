@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 dataset
 download_youtube/videos
+
+.cache/
+third_party_CLIP/
