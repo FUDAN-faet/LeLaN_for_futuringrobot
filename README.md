@@ -516,3 +516,71 @@ ros2 topic echo /cmd_vel_unstamped
 * `prompt` 与当前场景不匹配
 * 推理服务未正确连接
 * bridge 未收到图像
+
+
+# 2026年4月24日，重复试验，追踪"person sitting on chair"
+
+> 此时未加安全层，用来测试 LeLaN 本身的避障能力。
+
+### 0.首次运行或修改代码后，重新编译 ROS2 包：
+```bash
+source /opt/ros/jazzy/setup.bash
+cd ~/navi_ws
+colcon build --packages-select lelan_ros2 tb4_experiment_bringup
+```
+
+### 1.启动 Gazebo，确保每次的机器人都在同一个地方：
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/navi_ws/install/setup.bash
+
+mkdir -p /tmp/roslog
+export ROS_LOG_DIR=/tmp/roslog
+
+unset ROS_LOCALHOST_ONLY
+unset ROS_DOMAIN_ID
+
+ros2 launch tb4_experiment_bringup tb4_my_world.launch.py
+```
+
+### 2.启动 VLN 推理：
+```bash
+source /home/zme/anaconda3/etc/profile.d/conda.sh
+conda activate lelan
+cd ~/navi_ws/src/lelan_for_futuringrobot
+
+python deployment/src/lelan_inference_server.py \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --config train/config/lelan_col.yaml \
+  --model deployment/model_weights/with_col_loss.pth \
+  --device cuda:0 \
+  --prompt 'person sitting on a chair' \
+  --history-age-sec 1.0
+```
+
+### 3.启动纯神经网络控制桥接节点：
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/navi_ws/install/setup.bash
+mkdir -p /tmp/roslog
+export ROS_LOG_DIR=/tmp/roslog
+
+ros2 launch lelan_ros2 lelan_policy.launch.py \
+  image_topic:=/oakd/rgb/preview/image_raw \
+  cmd_vel_topic:=/cmd_vel_unstamped \
+  use_ricoh:=false \
+  timer_period:=0.10 \
+  request_timeout:=10.0 \
+  apply_velocity_limits:=false \
+  control_mode:=rollout \
+  replan_on_new_image:=false \
+  prompt:='person sitting on a chair' \
+  rollout_steps:=3
+```
+
+### 4.启用相机镜头：
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 run image_tools showimage --ros-args -r image:=/oakd/rgb/preview/image_raw
+```

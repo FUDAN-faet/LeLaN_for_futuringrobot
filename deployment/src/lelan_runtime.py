@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 import warnings
 
@@ -113,6 +114,7 @@ class LeLaNInferenceRuntime:
         model_path: Optional[str] = None,
         prompt: str = "chair",
         device: Optional[str] = None,
+        history_age_sec: float = 1.0,
     ) -> None:
         self.device = _resolve_runtime_device(device)
         self.model_path = _resolve_existing_path(
@@ -130,8 +132,8 @@ class LeLaNInferenceRuntime:
         self.prompt_features: Dict[str, torch.Tensor] = {}
         self.prompt = ""
         self.feat_text: Optional[torch.Tensor] = None
-        self.history_len = 10
-        self.image_hist = []
+        self.history_age_sec = max(0.0, float(history_age_sec))
+        self.image_hist: List[Tuple[float, object]] = []
         self.set_prompt(prompt)
 
     @staticmethod
@@ -163,15 +165,40 @@ class LeLaNInferenceRuntime:
         self.prompt = prompt
         self.feat_text = self.prompt_features[prompt].to(torch.float32)
 
-    def predict_from_cv2(self, cv_image, prompt: Optional[str] = None) -> Tuple[float, float]:
+    def _append_history_image(self, image, timestamp: float) -> None:
+        self.image_hist.append((timestamp, image))
+        max_age = max(3.0 * self.history_age_sec, 2.0)
+        cutoff = timestamp - max_age
+        self.image_hist = [
+            (ts, img)
+            for ts, img in self.image_hist
+            if ts >= cutoff
+        ]
+
+    def _select_history_image(self, timestamp: float):
+        if not self.image_hist:
+            raise RuntimeError("Image history is empty")
+
+        target_timestamp = timestamp - self.history_age_sec
+        for ts, image in reversed(self.image_hist):
+            if ts <= target_timestamp:
+                return image
+
+        return self.image_hist[0][1]
+
+    def predict_sequence_from_cv2(
+        self,
+        cv_image,
+        prompt: Optional[str] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         if prompt and prompt != self.prompt:
             self.set_prompt(prompt)
 
         image = cv2pil(cv_image)
-        if not self.image_hist:
-            self.image_hist = [image for _ in range(self.history_len)]
+        timestamp = time.monotonic()
+        self._append_history_image(image, timestamp)
 
-        hist_image = self.image_hist[self.history_len - 1]
+        hist_image = self._select_history_image(timestamp)
         obs_images, obs_current = transform_images_lelan(
             [hist_image, image],
             self.model_params["image_size"],
@@ -202,10 +229,15 @@ class LeLaNInferenceRuntime:
 
             linear_vel, angular_vel = self.model("dist_pred_net", obsgoal_cond=obsgoal_cond)
 
-        self.image_hist = [image] + self.image_hist[: self.history_len - 1]
+        linear_vels = linear_vel.detach().cpu().numpy()[0].astype(np.float32)
+        angular_vels = angular_vel.detach().cpu().numpy()[0].astype(np.float32)
+        return linear_vels, angular_vels
+
+    def predict_from_cv2(self, cv_image, prompt: Optional[str] = None) -> Tuple[float, float]:
+        linear_vels, angular_vels = self.predict_sequence_from_cv2(cv_image, prompt=prompt)
         return (
-            float(linear_vel.cpu().numpy()[0, 0]),
-            float(angular_vel.cpu().numpy()[0, 0]),
+            float(linear_vels[0]),
+            float(angular_vels[0]),
         )
 
 

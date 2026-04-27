@@ -54,14 +54,20 @@ class LeLaNRequestHandler(socketserver.BaseRequestHandler):
             prompt = header.get("prompt", "chair")
             cv_image = decode_jpeg_image(payload)
             with self.server.runtime_lock:
-                linear_vel, angular_vel = self.server.runtime.predict_from_cv2(cv_image, prompt=prompt)
+                linear_vels, angular_vels = self.server.runtime.predict_sequence_from_cv2(
+                    cv_image,
+                    prompt=prompt,
+                )
 
             send_message(
                 self.request,
                 {
                     "ok": True,
-                    "linear_vel": linear_vel,
-                    "angular_vel": angular_vel,
+                    "linear_vel": float(linear_vels[0]),
+                    "angular_vel": float(angular_vels[0]),
+                    "linear_vels": [float(v) for v in linear_vels],
+                    "angular_vels": [float(v) for v in angular_vels],
+                    "control_horizon": len(linear_vels),
                 },
             )
         except Exception as exc:  # pragma: no cover - runtime error reporting
@@ -76,6 +82,7 @@ def parse_args():
     parser.add_argument("--config", default="")
     parser.add_argument("--model", default="")
     parser.add_argument("--device", default="")
+    parser.add_argument("--history-age-sec", default=1.0, type=float)
     return parser.parse_args()
 
 
@@ -86,6 +93,7 @@ def main() -> None:
         model_path=args.model or None,
         prompt=args.prompt,
         device=args.device or None,
+        history_age_sec=args.history_age_sec,
     )
 
     with LeLaNServer((args.host, args.port), runtime, LeLaNRequestHandler) as server:
@@ -94,6 +102,7 @@ def main() -> None:
         print(f"model_path={runtime.model_path}")
         print(f"config_path={runtime.config_path}")
         print(f"prompt={runtime.prompt}")
+        print(f"history_age_sec={runtime.history_age_sec}")
         server.serve_forever()
 
 

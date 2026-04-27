@@ -1,9 +1,10 @@
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import socket
 import struct
 import sys
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -79,6 +80,15 @@ def preprocess_cv_image(cv_image: np.ndarray, use_ricoh: bool) -> np.ndarray:
     return cv2.flip(cropped, 1)
 
 
+@dataclass
+class PolicyPrediction:
+    linear_vels: List[float]
+    angular_vels: List[float]
+
+    def commands(self) -> List[Tuple[float, float]]:
+        return list(zip(self.linear_vels, self.angular_vels))
+
+
 class SocketPolicyBackend:
     def __init__(self, host: str, port: int, prompt: str, timeout: float, jpeg_quality: int) -> None:
         self.host = host
@@ -87,7 +97,7 @@ class SocketPolicyBackend:
         self.timeout = timeout
         self.jpeg_quality = jpeg_quality
 
-    def predict(self, cv_image: np.ndarray) -> Tuple[float, float]:
+    def predict(self, cv_image: np.ndarray) -> PolicyPrediction:
         ok, encoded = cv2.imencode(
             ".jpg",
             cv_image,
@@ -110,7 +120,19 @@ class SocketPolicyBackend:
         if not response.get("ok", False):
             raise RuntimeError(response.get("error", "Inference server returned an unknown error"))
 
-        return float(response["linear_vel"]), float(response["angular_vel"])
+        linear_vels = response.get("linear_vels")
+        angular_vels = response.get("angular_vels")
+        if linear_vels is None or angular_vels is None:
+            linear_vels = [float(response["linear_vel"])]
+            angular_vels = [float(response["angular_vel"])]
+
+        if len(linear_vels) != len(angular_vels):
+            raise RuntimeError("Inference server returned mismatched control horizon lengths")
+
+        return PolicyPrediction(
+            linear_vels=[float(v) for v in linear_vels],
+            angular_vels=[float(v) for v in angular_vels],
+        )
 
 
 class LocalPolicyBackend:
@@ -129,8 +151,12 @@ class LocalPolicyBackend:
             prompt=prompt,
         )
 
-    def predict(self, cv_image: np.ndarray) -> Tuple[float, float]:
-        return self.runtime.predict_from_cv2(cv_image)
+    def predict(self, cv_image: np.ndarray) -> PolicyPrediction:
+        linear_vels, angular_vels = self.runtime.predict_sequence_from_cv2(cv_image)
+        return PolicyPrediction(
+            linear_vels=[float(v) for v in linear_vels],
+            angular_vels=[float(v) for v in angular_vels],
+        )
 
 
 class LeLaNPolicyNode(Node):
@@ -151,6 +177,12 @@ class LeLaNPolicyNode(Node):
         self.declare_parameter("timer_period", 0.1)
         self.declare_parameter("max_linear_vel", 0.3)
         self.declare_parameter("max_angular_vel", 0.5)
+        self.declare_parameter("apply_velocity_limits", True)
+        self.declare_parameter("control_mode", "first_step")
+        self.declare_parameter("rollout_steps", 1)
+        self.declare_parameter("replan_on_new_image", True)
+        self.declare_parameter("adaptive_turn_rollout", False)
+        self.declare_parameter("turn_replan_threshold", 0.35)
 
         self.image_topic = self.get_parameter("image_topic").value
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
@@ -166,10 +198,23 @@ class LeLaNPolicyNode(Node):
         self.timer_period = float(self.get_parameter("timer_period").value)
         self.max_linear_vel = float(self.get_parameter("max_linear_vel").value)
         self.max_angular_vel = float(self.get_parameter("max_angular_vel").value)
+        self.apply_velocity_limits = bool(self.get_parameter("apply_velocity_limits").value)
+        self.control_mode = str(self.get_parameter("control_mode").value).strip().lower()
+        self.rollout_steps = max(1, int(self.get_parameter("rollout_steps").value))
+        self.replan_on_new_image = bool(self.get_parameter("replan_on_new_image").value)
+        self.adaptive_turn_rollout = bool(self.get_parameter("adaptive_turn_rollout").value)
+        self.turn_replan_threshold = max(
+            0.0,
+            float(self.get_parameter("turn_replan_threshold").value),
+        )
+
+        if self.control_mode not in {"first_step", "rollout"}:
+            raise ValueError("control_mode must be 'first_step' or 'rollout'")
 
         self.bridge = CvBridge()
         self.latest_processed_image: Optional[np.ndarray] = None
         self.last_backend_error: Optional[str] = None
+        self.pending_commands: List[Tuple[float, float]] = []
         self.backend = self._create_backend()
 
         self.image_sub = self.create_subscription(
@@ -186,6 +231,12 @@ class LeLaNPolicyNode(Node):
         self.get_logger().info(f"image_topic={self.image_topic}")
         self.get_logger().info(f"cmd_vel_topic={self.cmd_vel_topic}")
         self.get_logger().info(f"prompt={self.prompt}")
+        self.get_logger().info(f"apply_velocity_limits={self.apply_velocity_limits}")
+        self.get_logger().info(f"control_mode={self.control_mode}")
+        self.get_logger().info(f"rollout_steps={self.rollout_steps}")
+        self.get_logger().info(f"replan_on_new_image={self.replan_on_new_image}")
+        self.get_logger().info(f"adaptive_turn_rollout={self.adaptive_turn_rollout}")
+        self.get_logger().info(f"turn_replan_threshold={self.turn_replan_threshold}")
         if self.inference_backend == "socket":
             self.get_logger().info(f"server={self.server_host}:{self.server_port}")
         else:
@@ -214,14 +265,24 @@ class LeLaNPolicyNode(Node):
         self.latest_processed_image = preprocess_cv_image(cv_image, self.use_ricoh)
 
     def timer_callback(self) -> None:
-        if self.latest_processed_image is None:
+        processed_image: Optional[np.ndarray] = None
+        if self.latest_processed_image is not None:
+            processed_image = self.latest_processed_image
+            self.latest_processed_image = None
+
+        if processed_image is None:
+            if self.control_mode == "rollout" and self.pending_commands:
+                linear_vel, angular_vel = self.pending_commands.pop(0)
+                self.cmd_pub.publish(self._limit_velocity(linear_vel, angular_vel))
             return
 
-        processed_image = self.latest_processed_image
-        self.latest_processed_image = None
+        if self.control_mode == "rollout" and self.pending_commands and not self.replan_on_new_image:
+            linear_vel, angular_vel = self.pending_commands.pop(0)
+            self.cmd_pub.publish(self._limit_velocity(linear_vel, angular_vel))
+            return
 
         try:
-            linear_vel, angular_vel = self.backend.predict(processed_image)
+            prediction = self.backend.predict(processed_image)
             self.last_backend_error = None
         except Exception as exc:
             message = str(exc)
@@ -230,11 +291,27 @@ class LeLaNPolicyNode(Node):
                 self.last_backend_error = message
             return
 
+        commands = prediction.commands()
+        if not commands:
+            return
+
+        if self.control_mode == "rollout":
+            rollout_end = self._effective_rollout_end(commands)
+            self.pending_commands = commands[1:rollout_end]
+            linear_vel, angular_vel = commands[0]
+        else:
+            linear_vel, angular_vel = commands[0]
+
         self.get_logger().debug(f"Predicted velocity v={linear_vel:.3f}, w={angular_vel:.3f}")
         self.cmd_pub.publish(self._limit_velocity(linear_vel, angular_vel))
 
     def _limit_velocity(self, vt: float, wt: float) -> Twist:
         msg = Twist()
+        if not self.apply_velocity_limits:
+            msg.linear.x = vt
+            msg.angular.z = wt
+            return msg
+
         maxv = self.max_linear_vel
         maxw = self.max_angular_vel
 
@@ -260,6 +337,21 @@ class LeLaNPolicyNode(Node):
                     msg.angular.z = maxw * np.sign(wt)
 
         return msg
+
+    def _effective_rollout_end(self, commands: List[Tuple[float, float]]) -> int:
+        rollout_end = min(self.rollout_steps, len(commands))
+        if rollout_end <= 1 or not self.adaptive_turn_rollout:
+            return rollout_end
+
+        _, first_angular = commands[0]
+        if abs(first_angular) >= self.turn_replan_threshold:
+            self.get_logger().debug(
+                "Reducing rollout to 1 step because "
+                f"|w0|={abs(first_angular):.3f} >= {self.turn_replan_threshold:.3f}"
+            )
+            return 1
+
+        return rollout_end
 
 
 def main(args=None) -> None:

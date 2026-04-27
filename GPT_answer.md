@@ -1,216 +1,360 @@
-很好，参数已经足够了。
-你这个 ROS2 节点的参数名就是：
+对，**终端 3 维持 `/cmd_vel_unstamped` 不改**。既然你已经实测过这是能真正驱动车体的控制口，就以这个为准。
 
-* `image_topic`
-* `cmd_vel_topic`
-* `prompt`
-* `config_path`
-* `model_path`
-* `use_ricoh`
-* `timer_period`
-* `max_linear_vel`
-* `max_angular_vel`
+你现在要的不是“能不能避障”，而是**把避障成功率拉得很高**。
+按你当前仓库的实现，我的判断很明确：
 
-所以你现在已经可以**直接试运行**了。
+## 先别急着把 NoMaD 在线接进去
+
+**短期最有效的路线不是“在线双模型”，而是：**
+
+```text
+LeLaN -> /cmd_vel_raw
+      -> velocity_smoother
+      -> safety_filter(/scan, depth)
+      -> /cmd_vel_unstamped
+```
+
+原因很简单：
+
+* 你当前 `lelan_policy_node.py` 只订阅 **Image**，输出 **Twist**，只做速度限幅，不读 `/scan`、不读深度，也没有任何显式避障逻辑。
+* 你当前 `with_col_loss.pth + lelan_col.yaml` 这条线，虽然训练配置里有 `load_nomad: nomad/nomad_crop`，说明它已经利用 NoMaD 做过碰撞损失蒸馏，但这仍然是**离线训练增强**，不是**在线实时 NoMaD 避障**。
+* `nomad.yaml` 在仓库里是完整存在的，但你现在并没有一个在线 NoMaD runtime 挂在 ROS 控制链里。
+
+所以，**要把“撞上去”的概率快速压下去，最值钱的是 safety filter，不是先重构成 LeLaN+NoMaD 在线双推理。**
 
 ---
 
-# 先跑最简单版本
+# 我建议你今天下午就做的改造
 
-第一次本机测试，先用：
+## 一、先把控制链拆成三层
 
-* 配置：`lelan.yaml`
-* 权重：`wo_col_loss_wo_temp.pth`
+### 1. LeLaN 原始输出
 
-这样最轻、最容易先跑通。
+把你当前 bridge 的输出改成：
 
-你的文件路径就是：
+```text
+/cmd_vel_raw
+```
 
-```bash id="ps6s3c"
-/home/zme/navi_ws/src/LeLaN/train/config/lelan.yaml
-/home/zme/navi_ws/src/LeLaN/deployment/model_weights/wo_col_loss_wo_temp.pth
+而不是直接发到底盘。
+
+### 2. 平滑器节点
+
+订阅：
+
+* `/cmd_vel_raw`
+
+发布：
+
+* `/cmd_vel_smooth`
+
+### 3. 安全过滤节点
+
+订阅：
+
+* `/cmd_vel_smooth`
+* `/scan`
+* 可选 `/oakd/rgb/preview/depth`
+
+发布：
+
+* `/cmd_vel_unstamped`
+
+---
+
+# 二、为什么这个顺序最好
+
+你现在同时要两件事：
+
+1. 轨迹更平滑
+2. 避障成功率更高
+
+如果你把 smooth 放在最后，它会把 emergency stop 也“抹平”，这很危险。
+所以更好的顺序是：
+
+```text
+LeLaN -> 平滑 -> 安全层最终裁决
+```
+
+也就是说：
+
+* 平滑器负责减少抖动、急转、速度跳变
+* 安全层永远保留**最终否决权**
+
+---
+
+# 三、我建议的 safety filter 规则
+
+你现在仿真里已经有 `/scan`，这非常适合做一个激光安全层。
+这一步最稳，而且对真机迁移也最直接。
+
+## 扇区划分
+
+把激光分成三个主要扇区：
+
+* 左前：`+15° ~ +60°`
+* 正前：`-15° ~ +15°`
+* 右前：`-60° ~ -15°`
+
+对每个扇区求：
+
+* 最小距离 `d_min`
+* 可选均值 `d_mean`
+
+## 三段控制规则
+
+### 规则 1：急停
+
+如果正前最小距离
+
+```text
+d_front < 0.35 m
+```
+
+则：
+
+* `linear.x = 0`
+* `angular.z = +0.35 ~ +0.5` 或 `-0.35 ~ -0.5`
+* 朝更空的一边转
+
+### 规则 2：减速避障
+
+如果
+
+```text
+0.35 m <= d_front < 0.65 m
+```
+
+则：
+
+* `linear.x = min(linear.x, k*(d_front-0.35))`
+* 一般限到 `0.03 ~ 0.08 m/s`
+* 如果左边更近，就偏右；右边更近，就偏左
+
+### 规则 3：正常通过
+
+如果
+
+```text
+d_front >= 0.65 m
+```
+
+则：
+
+* 保留 `/cmd_vel_smooth`
+* 只做少量角速度安全裁剪
+
+---
+
+# 四、转向决策怎么做最稳
+
+我建议不用复杂规划器，先上一个很稳的 bias 规则：
+
+定义：
+
+```text
+bias = d_left - d_right
+```
+
+那么：
+
+* `bias > 0`：左边更空，优先左转
+* `bias < 0`：右边更空，优先右转
+
+可以给一个修正项：
+
+```text
+w_safe = k_turn * clip(bias, -bmax, bmax)
+```
+
+最终角速度：
+
+```text
+w_out = w_lelan + w_safe
+```
+
+但如果进入急停区，直接覆盖：
+
+```text
+v_out = 0
+w_out = sign(bias) * w_escape
 ```
 
 ---
 
-# 四个终端这样开
+# 五、平滑器怎么做
 
-## 终端 1：本机摄像头发布图像
+你现在 LeLaN 输出有时会比较“决绝”，而且 prompt 稍变化、视觉有噪声时，速度会跳。
+这时候平滑器非常重要。
 
-让话题名直接匹配节点默认值 `/camera/color/image_raw`：
+## 最简单有效的方法：一阶低通
 
-```bash id="c1pr2q"
-source /opt/ros/jazzy/setup.bash
-source ~/navi_ws/install/setup.bash
+对速度做指数平滑：
 
-ros2 run image_tools cam2image --ros-args -r image:=/camera/color/image_raw
+```text
+v_s = α * v_prev + (1-α) * v_raw
+w_s = β * w_prev + (1-β) * w_raw
 ```
+
+推荐初始值：
+
+* `α = 0.7`
+* `β = 0.6`
+
+这样角速度反应比线速度更快一点。
+
+## 再加一个加速度限制
+
+限制每周期的变化量：
+
+```text
+|v_t - v_{t-1}| <= 0.03 m/s
+|w_t - w_{t-1}| <= 0.08 rad/s
+```
+
+这样你的小车会明显稳很多，不会“抽风式点头”。
 
 ---
 
-## 终端 2：确认相机图像正常
+# 六、NoMaD 在你这里该怎么用
 
-```bash id="e6kxyy"
-source /opt/ros/jazzy/setup.bash
-source ~/navi_ws/install/setup.bash
+## 短期
 
-ros2 run image_tools showimage --ros-args -r image:=/camera/color/image_raw
+**NoMaD 不要先在线接。**
+
+因为你现在下午就要增强避障效果，最快的收益来自：
+
+* `/scan` safety filter
+* `cmd_vel` smoother
+
+## 中期
+
+用更强的 NoMaD 继续做 teacher，重新蒸馏 LeLaN。
+
+你当前 `lelan_col.yaml` 已经明确：
+
+```yaml
+load_nomad: nomad/nomad_crop
 ```
 
-如果这一步看不到图，先不要跑 LeLaN。
+这说明当前带碰撞损失的 LeLaN 本来就是借助 NoMaD teacher 来训练的。
+
+所以正确的中期路线是：
+
+1. 把 NoMaD 训练得更强
+2. 再蒸馏一版更强的 `with_col_loss.pth`
+3. 在线仍然跑 LeLaN + safety filter
+
+这样收益最高，系统复杂度最低。
+
+## 长期
+
+如果你后面真的想把系统做得很猛，可以再考虑：
+
+* LeLaN 提供语义目标趋向
+* NoMaD 提供避障轨迹偏置
+* safety filter 提供最终硬保护
+
+但这一步不适合今天下午做。
 
 ---
 
-## 终端 3：启动 LeLaN 节点
+# 七、你今天下午的最小可行方案
 
-直接用这条：
+如果你的目标是：
 
-```bash id="x30ng1"
-source /opt/ros/jazzy/setup.bash
-source ~/navi_ws/install/setup.bash
+**今天就把避障成功率显著拉起来**
 
-ros2 run lelan_ros2 lelan_policy_node --ros-args \
-  -p image_topic:="/camera/color/image_raw" \
-  -p cmd_vel_topic:="/cmd_vel_test" \
-  -p prompt:="chair" \
-  -p config_path:="/home/zme/navi_ws/src/LeLaN/train/config/lelan.yaml" \
-  -p model_path:="/home/zme/navi_ws/src/LeLaN/deployment/model_weights/wo_col_loss_wo_temp.pth" \
-  -p use_ricoh:=false \
-  -p timer_period:=0.1 \
-  -p max_linear_vel:=0.3 \
-  -p max_angular_vel:=0.5
+那我建议你按这个顺序做：
+
+### 第 1 步
+
+把 LeLaN bridge 输出改成：
+
+```text
+/cmd_vel_raw
 ```
 
-这里我把输出话题改成了：
+### 第 2 步
 
-```bash id="7wgubk"
-/cmd_vel_test
-```
+写一个 `velocity_smoother_node`
 
-这样不会误发到真实机器人控制链。
+* sub: `/cmd_vel_raw`
+* pub: `/cmd_vel_smooth`
+
+### 第 3 步
+
+写一个 `safety_filter_node`
+
+* sub: `/cmd_vel_smooth`
+* sub: `/scan`
+* pub: `/cmd_vel_unstamped`
+
+### 第 4 步
+
+在仿真里测试三类场景：
+
+* 前方无障碍，正常接近目标
+* 目标前有小箱子
+* 目标前有低矮障碍和侧向通道
+
+### 第 5 步
+
+调三组参数：
+
+* `front_stop_dist`
+* `front_slow_dist`
+* `turn_escape_speed`
 
 ---
 
-## 终端 4：看速度输出
+# 八、我建议你的初始参数
 
-```bash id="dxsk9j"
-source /opt/ros/jazzy/setup.bash
-source ~/navi_ws/install/setup.bash
+你可以先直接用这一组：
 
-ros2 topic echo /cmd_vel_test
-```
+## safety filter
 
----
+* `front_stop_dist = 0.35`
+* `front_slow_dist = 0.65`
+* `side_consider_dist = 0.55`
+* `escape_turn_speed = 0.45`
+* `slow_linear_cap = 0.06`
 
-# 你现在该怎么测
+## smoother
 
-拿一个简单目标到镜头前，比如：
+* `alpha_v = 0.7`
+* `alpha_w = 0.6`
+* `dv_max = 0.03`
+* `dw_max = 0.08`
 
-* 椅子：`chair`
-* 杯子：`cup`
-* 瓶子：`bottle`
+## LeLaN bridge
 
-先用 `chair` 试。
-观察 `/cmd_vel_test`：
+你现在保持：
 
-### 你应该重点看
+* `timer_period = 0.3`
+* `max_linear_vel = 0.15`
+* `max_angular_vel = 0.30`
 
-* 目标不在画面里时，输出不要一直乱跳
-* 目标进入画面中央时，`linear.x` 应该有明显变化
-* 目标偏左/偏右时，`angular.z` 应该跟着变化
-
-如果这几条成立，说明：
-
-**相机输入 → LeLaN 推理 → `Twist` 输出**
-
-这条近程链已经打通了。
+这是合理的起点。
 
 ---
 
-# 如果节点没有输出，立刻查这三件事
+# 九、我对你当前阶段的建议
 
-## 1）节点有没有真的启动
+一句话：
 
-```bash id="jlwm34"
-ros2 node list
-```
+**先把“学习到的避障”变成“学习趋向 + 硬安全层”。**
 
-你应该看到：
-
-```bash id="boqvxp"
-/lelan_policy_node
-```
-
-## 2）节点订阅和发布了什么
-
-```bash id="pjlwmv"
-ros2 node info /lelan_policy_node
-```
-
-重点看：
-
-* Subscriptions 里有没有 `/camera/color/image_raw`
-* Publishers 里有没有 `/cmd_vel_test`
-
-## 3）话题有没有数据
-
-```bash id="qfz989"
-ros2 topic hz /camera/color/image_raw
-ros2 topic info /cmd_vel_test
-```
+这样你才能真正把成功率做高。
+否则单靠 `with_col_loss.pth`，在近距离小障碍、低矮障碍、窄通道这些场景里，很难让成功率稳定到你想要的程度。
 
 ---
 
-# 如果你想用 launch，也可以试一下源码里的 launch 文件
+# 十、最直接的下一步
 
-你 grep 已经看到了本地源码里有：
+如果你愿意，我下一条直接给你两样东西：
 
-```bash id="ao4q1h"
-~/navi_ws/src/LeLaN/lelan_ros2/launch/lelan_policy.launch.py
-```
+1. **ROS2 Jazzy 版 `safety_filter_node.py` 的最小完整代码**
+2. **ROS2 Jazzy 版 `velocity_smoother_node.py` 的最小完整代码**
 
-虽然它没被安装到 `share/lelan_ros2`，但你仍然可以直接用源码路径试试：
-
-```bash id="03kw05"
-python3 ~/navi_ws/src/LeLaN/lelan_ros2/launch/lelan_policy.launch.py
-```
-
-不过我还是建议你**先用 `ros2 run`**，因为你现在最重要的是排除参数和模型路径问题。
-
----
-
-# 跑通后第二步怎么做
-
-等最简单版本跑通，再测带碰撞规避训练的版本：
-
-```bash id="9m7xva"
-ros2 run lelan_ros2 lelan_policy_node --ros-args \
-  -p image_topic:="/camera/color/image_raw" \
-  -p cmd_vel_topic:="/cmd_vel_test" \
-  -p prompt:="chair" \
-  -p config_path:="/home/zme/navi_ws/src/LeLaN/train/config/lelan_col.yaml" \
-  -p model_path:="/home/zme/navi_ws/src/LeLaN/deployment/model_weights/with_col_loss.pth" \
-  -p use_ricoh:=false \
-  -p timer_period:=0.1 \
-  -p max_linear_vel:=0.3 \
-  -p max_angular_vel:=0.5
-```
-
-这样你可以比较：
-
-* `wo_col_loss_wo_temp.pth`：最简单、最轻
-* `with_col_loss.pth`：带碰撞规避蒸馏，理论上更稳一些
-
----
-
-# 我建议你现在就执行的顺序
-
-按这个顺序来：
-
-1. 终端 1 跑 `cam2image`
-2. 终端 2 跑 `showimage`
-3. 终端 3 跑我给你的 `lelan_policy_node` 命令
-4. 终端 4 `echo /cmd_vel_test`
-
-然后把**终端 3 的启动日志**和**终端 4 的几行输出**发给我。
-如果有报错，我可以直接帮你定位到下一步。
+这样你下午就能直接接进当前工程里跑。
