@@ -521,6 +521,7 @@ ros2 topic echo /cmd_vel_unstamped
 # 2026年4月24日，重复试验，追踪"person sitting on chair"
 
 > 此时未加安全层，用来测试 LeLaN 本身的避障能力。
+> 重要备注：此节点已经在2026年4月27日经过验证，可以进行多轮次重复试验测试成功率了。
 
 ### 0.首次运行或修改代码后，重新编译 ROS2 包：
 ```bash
